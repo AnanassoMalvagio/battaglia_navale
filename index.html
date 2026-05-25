@@ -91,7 +91,7 @@ h1 {
 .cell:hover { background: rgba(52,152,219,.5); }
 .cell.preview-ok  { background: rgba(39,174,96,.6)  !important; }
 .cell.preview-bad { background: rgba(192,57,43,.6)  !important; }
-.cell.ship-p      { background: rgba(52,152,219,.38); }
+.cell.ship-p      { background: transparent; }
 .cell.hit  { background: #c0392b !important; cursor:default; font-size:calc(var(--cs)*.52); }
 .cell.miss { background: rgba(10,30,80,.7) !important; cursor:default;
              color:#3d6fa3; font-size:calc(var(--cs)*.6); }
@@ -348,13 +348,12 @@ function onPlayerClick(r, c) {
   pShips[sid] = { ...s, cells, hits: 0, sunk: false };
   cells.forEach(({r: pr, c: pc}) => {
     PG[pr][pc].ship = sid;
-    const el = cellEl('pgrid', pr, pc);
-    el.classList.add('ship-p');
-    el.style.background = s.color + '55';
+    cellEl('pgrid', pr, pc).classList.add('ship-p');
   });
 
   shipI++;
   refreshChips();
+  redrawShipCanvas();
 
   if (shipI >= FLEET.length) {
     startPlay();
@@ -373,6 +372,7 @@ function rotate() {
 function resetPlacement() {
   shipI = 0; ori = 'H'; PG = mkGrid(); pShips = {};
   buildGridDOM('pgrid-wrap', 'pgrid', true);
+  initShipCanvas();
   refreshChips();
   setMsg(`Posiziona ${FLEET[0].name} (${FLEET[0].size} celle) sulla tua griglia.`, '');
 }
@@ -495,6 +495,7 @@ function computerTurn() {
     setMsg(`Il computer ha sparato in (${x}, ${y}) — acqua! Tocca a te.`, '');
   }
 
+  redrawShipCanvas();
   setTurn('🎯 Turno del GIOCATORE — scegli un bersaglio!');
 }
 
@@ -628,11 +629,299 @@ function newGame() {
 
   buildGridDOM('pgrid-wrap', 'pgrid', true);
   buildGridDOM('egrid-wrap', 'egrid', false);
+  initShipCanvas();
   buildShipBar();
   placeComputerFleet();
 
   setMsg(`Posiziona la tua ${FLEET[0].name} (${FLEET[0].size} celle) — clicca sulla tua griglia.`, '');
 }
+
+// ─── Ship Canvas Overlay ──────────────────────────────────────────────────────
+let sCanvas = null, sCtx = null;
+
+function initShipCanvas() {
+  const wrap = document.getElementById('pgrid-wrap');
+  const old = wrap.querySelector('canvas.ship-cv');
+  if (old) old.remove();
+  wrap.style.position = 'relative';
+  sCanvas = document.createElement('canvas');
+  sCanvas.className = 'ship-cv';
+  sCanvas.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;';
+  wrap.appendChild(sCanvas);
+  sCtx = sCanvas.getContext('2d');
+}
+
+function redrawShipCanvas() {
+  if (!sCanvas || !sCtx) return;
+  const wrap = document.getElementById('pgrid-wrap');
+  const fc   = document.getElementById('pgrid_0_0');
+  if (!fc || !wrap) return;
+  const wR = wrap.getBoundingClientRect();
+  const cR = fc.getBoundingClientRect();
+  const cs = cR.width;
+  const ox = cR.left - wR.left;
+  const oy = cR.top  - wR.top;
+  sCanvas.width  = Math.round(wrap.offsetWidth);
+  sCanvas.height = Math.round(wrap.offsetHeight);
+  sCtx.clearRect(0, 0, sCanvas.width, sCanvas.height);
+  Object.entries(pShips).forEach(([sid, ship]) => {
+    renderShip(sCtx, parseInt(sid[1]), ship, cs, ox, oy);
+  });
+}
+
+function renderShip(ctx, idx, ship, cs, ox, oy) {
+  const cells = ship.cells;
+  const minR = Math.min(...cells.map(c => c.r));
+  const maxR = Math.max(...cells.map(c => c.r));
+  const minC = Math.min(...cells.map(c => c.c));
+  const maxC = Math.max(...cells.map(c => c.c));
+  const isH  = minR === maxR;
+  const px = ox + minC * cs, py = oy + minR * cs;
+  const pw = (maxC - minC + 1) * cs, ph = (maxR - minR + 1) * cs;
+
+  // Clip to non-hit cells and draw ship art
+  ctx.save();
+  ctx.beginPath();
+  let vis = false;
+  cells.forEach(c => {
+    if (!PG[c.r][c.c].hit) {
+      ctx.rect(ox + c.c * cs + 1, oy + c.r * cs + 1, cs - 2, cs - 2);
+      vis = true;
+    }
+  });
+  if (vis) {
+    ctx.clip();
+    if (isH) {
+      SHIP_DRAWERS[idx](ctx, px, py, pw, ph);
+    } else {
+      // Rotate 90° CW so "bow-right" becomes "bow-down"
+      ctx.translate(px + pw / 2, py + ph / 2);
+      ctx.rotate(Math.PI / 2);
+      SHIP_DRAWERS[idx](ctx, -ph / 2, -pw / 2, ph, pw);
+    }
+  }
+  ctx.restore();
+
+  // Damage overlay on hit cells
+  cells.forEach(c => {
+    if (!PG[c.r][c.c].hit) return;
+    const cx = ox + c.c * cs, cy = oy + c.r * cs;
+    ctx.save();
+    ctx.fillStyle = ship.sunk ? 'rgba(108,52,131,.85)' : 'rgba(192,57,43,.88)';
+    ctx.fillRect(cx + 1, cy + 1, cs - 2, cs - 2);
+    ctx.font = `${Math.round(cs * .55)}px serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(ship.sunk ? '⚓' : '💥', cx + cs / 2, cy + cs / 2);
+    ctx.restore();
+  });
+}
+
+// ─── Ship Drawers (horizontal, bow = right) ──────────────────────────────────
+const SHIP_DRAWERS = [
+
+  // 0 · Portaerei (5 celle) — grigio chiaro, ponte di volo, torre di controllo
+  (ctx, x, y, w, h) => {
+    const m = y + h * .5;
+    // Scafo
+    ctx.beginPath();
+    ctx.fillStyle = '#b8c0c8';
+    ctx.moveTo(x + 2, m + h * .22);
+    ctx.lineTo(x + w * .9, m + h * .22);
+    ctx.quadraticCurveTo(x + w - 2, m + h * .22, x + w - 2, m);
+    ctx.quadraticCurveTo(x + w - 2, m - h * .22, x + w * .9, m - h * .22);
+    ctx.lineTo(x + 2, m - h * .22);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = '#7f8c8d'; ctx.lineWidth = 1.2; ctx.stroke();
+    // Ponte di volo (flat top)
+    ctx.fillStyle = '#8d9aa0';
+    ctx.fillRect(x + 2, y + h * .14, w * .88, h * .2);
+    ctx.strokeStyle = '#6d7f80'; ctx.lineWidth = .7;
+    ctx.strokeRect(x + 2, y + h * .14, w * .88, h * .2);
+    // Torre di controllo
+    ctx.fillStyle = '#647880';
+    ctx.fillRect(x + w * .62, y + h * .06, w * .1, h * .22);
+    ctx.strokeStyle = '#4a6068'; ctx.lineWidth = .8;
+    ctx.strokeRect(x + w * .62, y + h * .06, w * .1, h * .22);
+    // Antenna radar
+    ctx.strokeStyle = '#4a6068'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(x + w * .67, y + h * .06); ctx.lineTo(x + w * .67, y + h * .01); ctx.stroke();
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x + w * .63, y + h * .03); ctx.lineTo(x + w * .71, y + h * .03); ctx.stroke();
+    // Aerei sul ponte (2 sagome)
+    ctx.fillStyle = '#1a6fa8';
+    [.15, .37].forEach(nx => {
+      const ax = x + nx * w, ay = y + h * .09;
+      ctx.fillRect(ax, ay + h * .06, w * .11, h * .05);
+      ctx.fillRect(ax - w * .015, ay + h * .02, w * .14, h * .03);
+    });
+  },
+
+  // 1 · Corazzata (4 celle) — acciaio blu-grigio, 2 torrette con cannoni
+  (ctx, x, y, w, h) => {
+    const m = y + h * .5;
+    // Scafo
+    ctx.beginPath();
+    ctx.fillStyle = '#7a8fa8';
+    ctx.moveTo(x + h * .12, m + h * .25);
+    ctx.lineTo(x + w * .86, m + h * .25);
+    ctx.quadraticCurveTo(x + w - 2, m + h * .25, x + w - 2, m);
+    ctx.quadraticCurveTo(x + w - 2, m - h * .25, x + w * .86, m - h * .25);
+    ctx.lineTo(x + h * .12, m - h * .25);
+    ctx.quadraticCurveTo(x + 2, m - h * .25, x + 2, m);
+    ctx.quadraticCurveTo(x + 2, m + h * .25, x + h * .12, m + h * .25);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#526070'; ctx.lineWidth = 1.2; ctx.stroke();
+    // Coperta
+    ctx.fillStyle = '#617585';
+    ctx.fillRect(x + h * .1, m - h * .12, w - h * .2, h * .07);
+    // Ponte di comando
+    ctx.fillStyle = '#4a5e6e';
+    ctx.fillRect(x + w * .38, m - h * .36, w * .24, h * .26);
+    // Ciminiera
+    ctx.fillStyle = '#3a4e5e';
+    ctx.fillRect(x + w * .46, m - h * .45, w * .08, h * .12);
+    ctx.fillStyle = 'rgba(180,180,180,.3)';
+    ctx.beginPath(); ctx.arc(x + w * .5, m - h * .49, h * .07, 0, Math.PI * 2); ctx.fill();
+    // Torretta anteriore
+    ctx.fillStyle = '#3a4e5e';
+    ctx.beginPath();
+    ctx.ellipse(x + w * .22, m - h * .13, h * .11, h * .09, 0, 0, Math.PI * 2);
+    ctx.fill(); ctx.strokeStyle = '#2a3a4a'; ctx.lineWidth = .8; ctx.stroke();
+    ctx.strokeStyle = '#2a3a4a'; ctx.lineWidth = h * .055; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(x + w * .23, m - h * .18); ctx.lineTo(x + w * .35, m - h * .3); ctx.stroke();
+    // Torretta posteriore
+    ctx.fillStyle = '#3a4e5e';
+    ctx.beginPath();
+    ctx.ellipse(x + w * .72, m - h * .13, h * .11, h * .09, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#2a3a4a'; ctx.lineWidth = h * .055;
+    ctx.beginPath(); ctx.moveTo(x + w * .73, m - h * .18); ctx.lineTo(x + w * .85, m - h * .3); ctx.stroke();
+    // Albero
+    ctx.strokeStyle = '#3a4e5e'; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(x + w * .5, m - h * .36); ctx.lineTo(x + w * .5, m - h * .52); ctx.stroke();
+    ctx.lineWidth = .8;
+    ctx.beginPath(); ctx.moveTo(x + w * .44, m - h * .45); ctx.lineTo(x + w * .56, m - h * .45); ctx.stroke();
+  },
+
+  // 2 · Incrociatore (3 celle) — blu oceano, scafo slanciato, torretta + albero alto
+  (ctx, x, y, w, h) => {
+    const m = y + h * .5;
+    // Scafo slanciato
+    ctx.beginPath();
+    ctx.fillStyle = '#4a7fa5';
+    ctx.moveTo(x + 2, m + h * .2);
+    ctx.lineTo(x + w * .78, m + h * .2);
+    ctx.quadraticCurveTo(x + w - 2, m + h * .18, x + w - 2, m);
+    ctx.quadraticCurveTo(x + w - 2, m - h * .18, x + w * .78, m - h * .2);
+    ctx.lineTo(x + 2, m - h * .2);
+    ctx.quadraticCurveTo(x - h * .08, m, x + 2, m + h * .2);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#2e6080'; ctx.lineWidth = 1.2; ctx.stroke();
+    // Coperta
+    ctx.fillStyle = '#3a7098';
+    ctx.fillRect(x + 4, m - h * .12, w - 8, h * .07);
+    // Ponte di comando
+    ctx.fillStyle = '#2a5a78';
+    ctx.fillRect(x + w * .52, m - h * .32, w * .2, h * .22);
+    // Torretta anteriore
+    ctx.fillStyle = '#1e4a62';
+    ctx.beginPath();
+    ctx.ellipse(x + w * .24, m - h * .1, h * .1, h * .08, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#142e42'; ctx.lineWidth = h * .06; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(x + w * .25, m - h * .15); ctx.lineTo(x + w * .38, m - h * .28); ctx.stroke();
+    // Albero alto
+    ctx.strokeStyle = '#1e3e58'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(x + w * .62, m - h * .32); ctx.lineTo(x + w * .62, m - h * .52); ctx.stroke();
+    ctx.lineWidth = .8;
+    ctx.beginPath(); ctx.moveTo(x + w * .56, m - h * .44); ctx.lineTo(x + w * .68, m - h * .44); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x + w * .58, m - h * .37); ctx.lineTo(x + w * .66, m - h * .37); ctx.stroke();
+  },
+
+  // 3 · Sottomarino (3 celle) — verde scuro, corpo a sigaro, torretta, periscopio
+  (ctx, x, y, w, h) => {
+    const m = y + h * .58;
+    // Corpo principale (ellisse)
+    ctx.beginPath();
+    ctx.fillStyle = '#27804f';
+    ctx.ellipse(x + w * .5, m, w * .45, h * .3, 0, 0, Math.PI * 2);
+    ctx.fill(); ctx.strokeStyle = '#165a35'; ctx.lineWidth = 1.5; ctx.stroke();
+    // Riflesso sulla scocca
+    ctx.save();
+    ctx.beginPath();
+    ctx.ellipse(x + w * .5, m, w * .45, h * .3, 0, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.fillStyle = 'rgba(80,200,120,.18)';
+    ctx.beginPath(); ctx.ellipse(x + w * .5, m - h * .12, w * .32, h * .1, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    // Elica a poppa (sinistra)
+    ctx.strokeStyle = '#165a35'; ctx.lineWidth = h * .09; ctx.lineCap = 'round';
+    const ex = x + w * .07, ey = m;
+    ctx.beginPath(); ctx.moveTo(ex, ey - h * .18); ctx.quadraticCurveTo(ex - h * .1, ey, ex, ey + h * .18); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(ex - h * .18, ey); ctx.quadraticCurveTo(ex, ey - h * .08, ex + h * .18, ey); ctx.stroke();
+    // Torretta
+    ctx.fillStyle = '#1e6b3e';
+    const twx = x + w * .42, twy = m - h * .62, tww = w * .16, twh = h * .34;
+    ctx.beginPath();
+    ctx.moveTo(twx + 3, twy + twh); ctx.lineTo(twx + tww - 3, twy + twh);
+    ctx.lineTo(twx + tww - 3, twy + 3);
+    ctx.quadraticCurveTo(twx + tww / 2, twy - 2, twx + 3, twy + 3);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#145530'; ctx.lineWidth = 1; ctx.stroke();
+    // Oblò torretta
+    ctx.fillStyle = '#0a3520';
+    ctx.beginPath(); ctx.arc(twx + tww / 2, twy + twh * .55, h * .045, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(80,200,120,.5)'; ctx.lineWidth = .8; ctx.stroke();
+    // Periscopio
+    ctx.strokeStyle = '#0e4022'; ctx.lineWidth = h * .09; ctx.lineCap = 'square';
+    ctx.beginPath();
+    ctx.moveTo(twx + tww * .65, twy);
+    ctx.lineTo(twx + tww * .65, twy - h * .22);
+    ctx.lineTo(twx + tww * .65 + h * .12, twy - h * .22);
+    ctx.stroke();
+    ctx.fillStyle = '#0e4022';
+    ctx.beginPath(); ctx.arc(twx + tww * .65 + h * .12, twy - h * .22, h * .05, 0, Math.PI * 2); ctx.fill();
+  },
+
+  // 4 · Cacciatorpediniere (2 celle) — blu navy, piccolo e veloce, cannone
+  (ctx, x, y, w, h) => {
+    const m = y + h * .5;
+    // Scafo appuntito
+    ctx.beginPath();
+    ctx.fillStyle = '#2060a0';
+    ctx.moveTo(x + 2, m + h * .2);
+    ctx.lineTo(x + w * .72, m + h * .2);
+    ctx.quadraticCurveTo(x + w - 2, m + h * .18, x + w - 2, m);
+    ctx.quadraticCurveTo(x + w - 2, m - h * .18, x + w * .72, m - h * .2);
+    ctx.lineTo(x + 2, m - h * .2);
+    ctx.quadraticCurveTo(x - h * .1, m, x + 2, m + h * .2);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#1a4878'; ctx.lineWidth = 1.2; ctx.stroke();
+    // Righe di velocità
+    ctx.strokeStyle = 'rgba(100,180,255,.28)'; ctx.lineWidth = .8;
+    [.3, .45].forEach(ny => {
+      ctx.beginPath(); ctx.moveTo(x + w * .12, y + h * ny); ctx.lineTo(x + w * .9, y + h * ny); ctx.stroke();
+    });
+    // Ponte di comando
+    ctx.fillStyle = '#164878';
+    ctx.fillRect(x + w * .38, m - h * .3, w * .28, h * .22);
+    // Torretta cannone
+    ctx.fillStyle = '#0e3860';
+    ctx.beginPath();
+    ctx.ellipse(x + w * .22, m - h * .1, h * .1, h * .08, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#08283a'; ctx.lineWidth = h * .06; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(x + w * .23, m - h * .15); ctx.lineTo(x + w * .38, m - h * .3); ctx.stroke();
+    // Albero
+    ctx.strokeStyle = '#164878'; ctx.lineWidth = 1.3;
+    ctx.beginPath(); ctx.moveTo(x + w * .53, m - h * .3); ctx.lineTo(x + w * .53, m - h * .5); ctx.stroke();
+    ctx.lineWidth = .8;
+    ctx.beginPath(); ctx.moveTo(x + w * .47, m - h * .42); ctx.lineTo(x + w * .59, m - h * .42); ctx.stroke();
+  },
+];
+
+window.addEventListener('resize', redrawShipCanvas);
 
 // ─── Boot ──────────────────────────────────────────────────────────────────────
 newGame();
